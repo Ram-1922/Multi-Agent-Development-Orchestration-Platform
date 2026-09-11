@@ -19,7 +19,7 @@ const Sidebar = ({isCollapsed,setIsCollapsed,setNotify}) => {
   ];
 
   return (
-    <aside className={`${isCollapsed ? 'w-72' : 'w-30' } h-screen fixed left-0 top-0 border-r border-white/[0.04] bg-zinc-950/70 backdrop-blur-2xl flex flex-col justify-between z-20 select-none`}>
+    <aside className={`${isCollapsed ? 'w-72' : 'w-30' } h-screen fixed left-0 top-0 border-r border-white/[0.14] bg-zinc-950/70 backdrop-blur-2xl flex flex-col justify-between z-20 select-none`}>
       <div className="p-8">
         <div className="flex items-center gap-4 mb-12 group cursor-pointer">
           <div onClick={()=>setIsCollapsed(!isCollapsed)} className="w-11 h-11 p-1 rounded-xl bg-zinc-900 border border-white/10 flex items-center justify-center transition-all duration-300 ease-out group-hover:border-[#c05858]/40 group-hover:scale-105 group-hover:shadow-[0_0_15px_rgba(192,88,88,0.2)] active:scale-95">
@@ -27,7 +27,7 @@ const Sidebar = ({isCollapsed,setIsCollapsed,setNotify}) => {
           </div>
           {isCollapsed && <div>
             <h1 className="text-xl font-extrabold tracking-tight text-[#c05858] flex items-center gap-2">
-              Agent Forge
+              <span className='text-white'>Agent</span> Forge
             </h1>
           </div>}
         </div>
