@@ -1,0 +1,948 @@
+import os
+import time
+import json
+import base64
+import asyncio
+import httpx
+import numpy as np
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# CLIENT & ENVIRONMENT CONFIGURATION
+# ---------------------------------------------------------------------------
+try:
+    import trafilatura
+except ImportError:
+    trafilatura = None
+
+try:
+    from tavily import TavilyClient
+    tavily_api_key = os.getenv("TAVILY_API_KEY")
+    if tavily_api_key:
+        tavily_client = TavilyClient(api_key=tavily_api_key)
+        print("DEBUG: Tavily Client successfully initialized!")
+    else:
+        tavily_client = None
+        print("WARNING: TAVILY_API_KEY not found in environment variables.")
+except ImportError:
+    tavily_client = None
+    print("WARNING: tavily-python is not installed. Run `pip install tavily-python`")
+
+try:
+    from ddgs import DDGS
+    print("DEBUG: DDGS (ddgs) client successfully initialized!")
+except ImportError:
+    try:
+        from duckduckgo_search import DDGS
+        print("DEBUG: DDGS (duckduckgo_search legacy) client successfully initialized!")
+    except ImportError:
+        DDGS = None
+        print("WARNING: ddgs is not installed. Run `pip install ddgs`")
+
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+OLLAMA_THINK_TOOLS = os.getenv("OLLAMA_THINK_TOOLS", "false").lower() == "true"
+OLLAMA_THINK_SYNTHESIS = os.getenv("OLLAMA_THINK_SYNTHESIS", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# SHARED HTTP CLIENT
+# ---------------------------------------------------------------------------
+_http_client: httpx.AsyncClient | None = None
+
+async def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=120.0,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
+    return _http_client
+
+async def close_http_client():
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+
+async def _with_retries(coro_fn, *args, retries: int = 2, base_delay: float = 0.6, **kwargs):
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return await coro_fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                await asyncio.sleep(base_delay * (2**attempt))
+    raise last_exc
+
+# ---------------------------------------------------------------------------
+# IN-MEMORY TTL CACHE
+# ---------------------------------------------------------------------------
+_CACHE: dict = {}
+_CACHE_TTL_SECONDS = 300
+
+def _cache_get(key: str):
+    entry = _CACHE.get(key)
+    if entry and (time.time() - entry[0]) < _CACHE_TTL_SECONDS:
+        return entry[1]
+    return None
+
+def _cache_set(key: str, value):
+    _CACHE[key] = (time.time(), value)
+
+_SEARCH_SEMAPHORE = asyncio.Semaphore(3)
+_FETCH_SEMAPHORE = asyncio.Semaphore(4)
+_DDGS_SEMAPHORE = asyncio.Semaphore(5)
+
+MODEL_MAP = {
+    "qwen3-8b": "qwen3:8b",
+    "qwen3": "qwen3:8b",
+    "qwen": "qwen3:8b",
+    "llama3": "llama3",
+}
+
+def resolve_model_tag(engine: str) -> str:
+    engine_lower = engine.lower()
+    for key, tag in MODEL_MAP.items():
+        if key in engine_lower:
+            return tag
+    return "qwen3:8b"
+
+# ---------------------------------------------------------------------------
+# TOOL SCHEMAS
+# ---------------------------------------------------------------------------
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the live web for verified facts, current news, official lists, "
+                "rankings, and articles via Tavily and DuckDuckGo. Always run this first "
+                "when answering queries about recent events, music charts, or real-world data."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The exact search query."},
+                    "topic": {
+                        "type": "string",
+                        "enum": ["general", "news"],
+                        "description": "'news' for breaking events, 'general' otherwise.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_search",
+            "description": (
+                "Search the web for real, high-quality images, photos, or diagrams (e.g. BMW cars, "
+                "landscapes, celebrities). Returns image titles and verified direct image URLs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Specific visual search term."},
+                    "max_results": {"type": "integer", "description": "Number of images to return (default 5)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "youtube_search",
+            "description": (
+                "Search YouTube for verified video content. Pass a single 'query' or a list "
+                "of specific song/video titles in 'queries'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "A single search term."},
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of specific titles to resolve (e.g. ['Song 1', 'Song 2']).",
+                    },
+                    "max_results": {"type": "integer", "description": "Results per query (default 1)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "multi_platform_search",
+            "description": (
+                "Resolves verified direct links for a list of verified titles (songs, tracks, albums) "
+                "across streaming platforms (YouTube, Spotify, Apple Music, SoundCloud, Genius). "
+                "Call this with the exact song names discovered from web_search."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of song titles formatted as 'Title - Artist'.",
+                    },
+                    "platforms": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["youtube", "spotify", "apple_music", "soundcloud", "genius"],
+                        },
+                        "description": "Platforms to fetch links from. Defaults to ['youtube', 'spotify'].",
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch and extract clean full-page text from a specific URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The complete HTTP/HTTPS URL."},
+                    "focus": {"type": "string", "description": "Keywords to isolate in long pages."},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
+# CHUNKING & RE-RANKING
+# ---------------------------------------------------------------------------
+def _chunk_text(text: str, chunk_words: int = 180, overlap_words: int = 30, max_chunks: int = 10) -> list:
+    words = text.split()
+    if len(words) <= chunk_words:
+        return [text]
+    chunks = []
+    step = chunk_words - overlap_words
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i : i + chunk_words])
+        if chunk:
+            chunks.append(chunk)
+        if len(chunks) >= max_chunks or i + chunk_words >= len(words):
+            break
+    return chunks
+
+async def _rank_chunks_by_relevance(focus: str, chunks: list, top_k: int = 3) -> list:
+    focus_vec = await generate_embedding(focus, task="search_query")
+    if not focus_vec:
+        return chunks[:top_k]
+    chunk_vecs = await asyncio.gather(*(generate_embedding(c, task="search_document") for c in chunks))
+    scored = [
+        (calculate_similarity(focus_vec, vec), chunk)
+        for vec, chunk in zip(chunk_vecs, chunks)
+        if vec
+    ]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [chunk for _, chunk in scored[:top_k]] or chunks[:top_k]
+
+# ---------------------------------------------------------------------------
+# TOOL IMPLEMENTATIONS
+# ---------------------------------------------------------------------------
+async def _ddgs_text_search(query: str, max_results: int = 5, region: str = "wt-wt") -> list:
+    if DDGS is None:
+        return []
+    def _sync_search():
+        with DDGS() as ddgs:
+            return list(ddgs.text(query, region=region, safesearch="moderate", max_results=max_results))
+    async def _run():
+        async with _DDGS_SEMAPHORE:
+            return await asyncio.to_thread(_sync_search)
+    try:
+        return await asyncio.wait_for(_with_retries(_run, retries=1, base_delay=0.7), timeout=12.0)
+    except Exception as e:
+        print(f"[DDGS ERROR] >>> '{query}': {e}")
+        return []
+
+async def _search_structured(query: str, topic: str = "general", max_results: int = 5):
+    cache_key = f"search:{topic}:{query.strip().lower()}:{max_results}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    async def _run_tavily():
+        if not tavily_client:
+            return "", []
+        try:
+            print(f"[TAVILY SEARCH] >>> Query: '{query}' | Topic: '{topic}'")
+            resp = await asyncio.to_thread(
+                tavily_client.search,
+                query=query,
+                topic=topic if topic in ("general", "news") else "general",
+                max_results=max_results,
+                include_answer="basic",
+                search_depth="advanced",
+            )
+            results = resp.get("results", [])
+            tavily_answer = resp.get("answer", "")
+            sources, formatted = [], ""
+            if tavily_answer:
+                formatted += f"**Quick Summary:** {tavily_answer}\n\n"
+            for r in results:
+                title, url, content = r.get("title", "Reference Link"), r.get("url", ""), r.get("content", "")
+                if url:
+                    sources.append({"title": title, "url": url})
+                    formatted += f"- **[{title}]({url})**\n  *Excerpt:* {content[:300]}...\n\n"
+            return formatted, sources
+        except Exception as e:
+            print(f"[TAVILY ERROR] >>> {e}")
+            return "", []
+
+    async def _run_ddgs():
+        raw = await _ddgs_text_search(query, max_results=max_results)
+        sources, formatted = [], ""
+        for r in raw:
+            title, url, body = r.get("title", "Reference Link"), r.get("href", ""), r.get("body", "")
+            if url:
+                sources.append({"title": title, "url": url})
+                formatted += f"- **[{title}]({url})**\n  *Summary:* {body[:300]}\n\n"
+        return formatted, sources
+
+    async with _SEARCH_SEMAPHORE:
+        (tav_text, tav_sources), (ddg_text, ddg_sources) = await asyncio.gather(_run_tavily(), _run_ddgs())
+
+    tav_urls = {s["url"] for s in tav_sources}
+    merged_sources = tav_sources + [s for s in ddg_sources if s["url"] not in tav_urls]
+
+    if tav_text:
+        merged_text = tav_text
+    elif ddg_text:
+        merged_text = ddg_text
+    else:
+        merged_text = "No verified web results found."
+
+    result = (merged_text, merged_sources)
+    _cache_set(cache_key, result)
+    return result
+
+async def perform_web_search(query: str, topic: str = "general", max_results: int = 5) -> str:
+    text, _ = await _search_structured(query, topic, max_results)
+    return text
+
+# --- IMAGE SEARCH TOOL ---
+async def image_search(query: str, max_results: int = 5) -> str:
+    """
+    Searches the live web for verified images using DuckDuckGo Images.
+    """
+    if DDGS is None:
+        return "Image search unavailable: ddgs package is not installed."
+
+    cache_key = f"img:{query.strip().lower()}:{max_results}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    def _sync_images():
+        with DDGS() as ddgs:
+            return list(ddgs.images(query, max_results=max_results))
+
+    try:
+        print(f"[IMAGE SEARCH] >>> Searching images for: '{query}'")
+        raw_images = await asyncio.to_thread(_sync_images)
+        if not raw_images:
+            return f"No images found for '{query}'."
+
+        formatted = f"--- 🖼️ VERIFIED IMAGE RESULTS FOR '{query}' ---\n"
+        for img in raw_images:
+            title = img.get("title", "Image")
+            image_url = img.get("image", "")
+            source_url = img.get("url", "")
+            if image_url:
+                formatted += f"- **[{title}]({image_url})** | [Source Page]({source_url})\n"
+
+        _cache_set(cache_key, formatted)
+        return formatted
+    except Exception as e:
+        print(f"[IMAGE SEARCH ERROR] >>> {e}")
+        return f"Error executing image search: {str(e)}"
+
+# --- YOUTUBE SEARCH TOOL ---
+_YOUTUBE_SEMAPHORE = asyncio.Semaphore(10)
+
+async def _fetch_single_yt(q: str, max_results: int = 1) -> dict | None:
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        # Fallback to DDGS video search if YouTube API key is missing
+        if DDGS:
+            try:
+                def _ddg_vid():
+                    with DDGS() as ddgs:
+                        return list(ddgs.videos(q, max_results=1))
+                vids = await asyncio.to_thread(_ddg_vid)
+                if vids:
+                    v_url = vids[0].get("content") or vids[0].get("url")
+                    if v_url and ("youtube.com" in v_url or "youtu.be" in v_url):
+                        return {
+                            "id": v_url,
+                            "url": v_url,
+                            "title": vids[0].get("title", "Video"),
+                            "channel": "YouTube",
+                            "query": q
+                        }
+            except Exception:
+                pass
+        return None
+
+    cache_key = f"yt:{q.strip().lower()}:{max_results}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    endpoint = "https://www.googleapis.com/youtube/v3/search"
+    params = {"part": "snippet", "q": q, "type": "video", "maxResults": max_results, "key": api_key}
+    result = None
+    try:
+        async with _YOUTUBE_SEMAPHORE:
+            client = await _get_http_client()
+            resp = await client.get(endpoint, params=params, timeout=10.0)
+        if resp.status_code == 200:
+            items = resp.json().get("items", [])
+            if items:
+                vid = items[0]
+                vid_id = vid.get("id", {}).get("videoId")
+                snippet = vid.get("snippet", {})
+                if vid_id:
+                    result = {
+                        "id": vid_id,
+                        "url": f"https://www.youtube.com/watch?v={vid_id}",
+                        "title": snippet.get("title", "Video"),
+                        "channel": snippet.get("channelTitle", "Channel"),
+                        "query": q,
+                    }
+    except Exception as e:
+        print(f"YT API Error for '{q}': {e}")
+    if result:
+        _cache_set(cache_key, result)
+    return result
+
+async def youtube_search(query: str = "", queries: list = None, max_results: int = 1) -> str:
+    search_list = queries if queries and isinstance(queries, list) else []
+    if query and not search_list:
+        search_list = [query]
+
+    if not search_list:
+        return "No search query provided."
+
+    search_list = list(dict.fromkeys(search_list))[:25]
+    print(f"[YOUTUBE API] >>> Iterating {len(search_list)} queries concurrently...")
+    results = await asyncio.gather(*(_fetch_single_yt(q, max_results) for q in search_list))
+
+    formatted_results = f"--- 🎬 VERIFIED YOUTUBE RESULTS ({len(search_list)} QUERIES) ---\n"
+    seen_ids = set()
+    valid_count = 0
+
+    for res in results:
+        if not res or res["id"] in seen_ids:
+            continue
+        seen_ids.add(res["id"])
+        valid_count += 1
+        formatted_results += f"- **[{res['title']}]({res['url']})** | Channel: {res['channel']} (Query: {res['query']})\n"
+
+    if valid_count == 0:
+        return "No verified YouTube videos found for the requested items."
+
+    return formatted_results
+
+# --- MULTI-PLATFORM RESOLUTION ---
+PLATFORM_SITE_MAP = {
+    "apple_music": "music.apple.com",
+    "soundcloud": "soundcloud.com",
+    "genius": "genius.com",
+}
+DEFAULT_PLATFORMS = ["youtube", "spotify"]
+ALL_PLATFORMS = ["youtube", "spotify", "apple_music", "soundcloud", "genius"]
+
+_spotify_token_cache = {"token": None, "expires_at": 0.0}
+_SPOTIFY_SEMAPHORE = asyncio.Semaphore(8)
+
+async def _get_spotify_token() -> str | None:
+    if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+        return None
+    if _spotify_token_cache["token"] and time.time() < _spotify_token_cache["expires_at"] - 30:
+        return _spotify_token_cache["token"]
+    try:
+        client = await _get_http_client()
+        auth_header = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+        resp = await client.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "client_credentials"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        _spotify_token_cache["token"] = data["access_token"]
+        _spotify_token_cache["expires_at"] = time.time() + data.get("expires_in", 3600)
+        return _spotify_token_cache["token"]
+    except Exception as e:
+        print(f"[SPOTIFY AUTH ERROR] >>> {e}")
+        return None
+
+async def _spotify_track_search(item: str) -> dict | None:
+    cache_key = f"spotify:{item.strip().lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = None
+    token = await _get_spotify_token()
+    if token:
+        try:
+            async with _SPOTIFY_SEMAPHORE:
+                client = await _get_http_client()
+                resp = await client.get(
+                    "https://api.spotify.com/v1/search",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"q": item, "type": "track", "limit": 1},
+                    timeout=10.0,
+                )
+            if resp.status_code == 200:
+                tracks = resp.json().get("tracks", {}).get("items", [])
+                if tracks:
+                    t = tracks[0]
+                    result = {
+                        "url": t["external_urls"]["spotify"],
+                        "title": t.get("name", item),
+                    }
+        except Exception as e:
+            print(f"[SPOTIFY SEARCH ERROR] >>> '{item}': {e}")
+
+    if result is None:
+        hits = await _ddgs_text_search(f"{item} site:open.spotify.com/track", max_results=1)
+        if hits:
+            result = {"url": hits[0].get("href", ""), "title": hits[0].get("title", item)}
+
+    if result and result.get("url"):
+        _cache_set(cache_key, result)
+        return result
+    return None
+
+async def _platform_link_search(item: str, platform: str) -> dict | None:
+    site = PLATFORM_SITE_MAP.get(platform)
+    if not site:
+        return None
+    cache_key = f"platform:{platform}:{item.strip().lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    hits = await _ddgs_text_search(f"{item} site:{site}", max_results=1)
+    if hits and hits[0].get("href"):
+        result = {"url": hits[0]["href"], "title": hits[0].get("title", item)}
+        _cache_set(cache_key, result)
+        return result
+    return None
+
+async def multi_platform_search(items: list, platforms: list = None, max_results: int = 1) -> str:
+    if not items or not isinstance(items, list):
+        return "No items provided."
+
+    items = list(dict.fromkeys(i.strip() for i in items if i and i.strip()))[:25]
+    if not items:
+        return "No valid items provided."
+
+    platforms = [p for p in (platforms or DEFAULT_PLATFORMS) if p in ALL_PLATFORMS] or DEFAULT_PLATFORMS
+
+    async def _resolve_item(item: str):
+        tasks = {}
+        if "youtube" in platforms:
+            tasks["youtube"] = _fetch_single_yt(item, max_results)
+        if "spotify" in platforms:
+            tasks["spotify"] = _spotify_track_search(item)
+        for p in ("apple_music", "soundcloud", "genius"):
+            if p in platforms:
+                tasks[p] = _platform_link_search(item, p)
+        keys = list(tasks.keys())
+        values = await asyncio.gather(*tasks.values())
+        return item, dict(zip(keys, values))
+
+    print(f"[MULTI-PLATFORM SEARCH] >>> Resolving {len(items)} items across {platforms}...")
+    resolved = await asyncio.gather(*(_resolve_item(i) for i in items))
+
+    seen_urls = set()
+    lines = [f"--- 🔗 VERIFIED MEDIA LINKS ({len(items)} items) ---"]
+    for item, hits in resolved:
+        lines.append(f"\n### {item}")
+        found_any = False
+        for p in platforms:
+            hit = hits.get(p)
+            url = hit.get("url") if hit else None
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                lines.append(f"- **{p.replace('_', ' ').title()}:** {url}")
+                found_any = True
+        if not found_any:
+            lines.append("- *No verified direct link found on requested platforms.*")
+
+    return "\n".join(lines)
+
+async def fetch_url_content(url: str, focus: str = None, max_chars: int = 4000) -> str:
+    if trafilatura is None:
+        return "Error: trafilatura is not installed."
+    cache_key = f"fetch:{url}:{focus or ''}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    async def _run():
+        async with _FETCH_SEMAPHORE:
+            downloaded = await asyncio.to_thread(trafilatura.fetch_url, url)
+            if not downloaded:
+                raise RuntimeError(f"could not download {url}")
+            text = await asyncio.to_thread(trafilatura.extract, downloaded, include_comments=False, include_tables=True)
+            if not text:
+                raise RuntimeError(f"could not extract readable content from {url}")
+            return text
+    try:
+        text = await _with_retries(_run, retries=1)
+    except Exception as e:
+        return f"Error fetching {url}: {e}"
+    if focus and len(text) > 1500:
+        chunks = _chunk_text(text)
+        best_chunks = await _rank_chunks_by_relevance(focus, chunks)
+        result = "\n...\n".join(best_chunks)
+    elif len(text) > max_chars:
+        result = text[:max_chars] + "\n...[truncated]"
+    else:
+        result = text
+    _cache_set(cache_key, result)
+    return result
+
+TOOL_DISPATCH = {
+    "web_search": lambda args: perform_web_search(args.get("query", ""), args.get("topic", "general")),
+    "image_search": lambda args: image_search(args.get("query", ""), args.get("max_results", 5)),
+    "youtube_search": lambda args: youtube_search(
+        query=args.get("query", ""),
+        queries=args.get("queries", []),
+        max_results=args.get("max_results", 1),
+    ),
+    "multi_platform_search": lambda args: multi_platform_search(
+        items=args.get("items", []),
+        platforms=args.get("platforms"),
+        max_results=args.get("max_results", 1),
+    ),
+    "fetch_url": lambda args: fetch_url_content(args.get("url", ""), args.get("focus")),
+}
+
+# ---------------------------------------------------------------------------
+# GEMINI MANUAL PROTOCOL
+# ---------------------------------------------------------------------------
+def _build_gemini_tool_prompt() -> str:
+    lines = [
+        "\n\n--- 🛠️ TOOL USE PROTOCOL ---",
+        "You have access to tools. To call one, respond ONLY with a single valid JSON object:",
+        '{"tool_call": {"name": "<tool_name>", "arguments": { ... }}}',
+        "Wait for the '[TOOL RESULT ...]' response. Do not invent links or information. ",
+        "Once you have all results, respond in markdown prose to the user.",
+        "\nAVAILABLE TOOLS:",
+    ]
+    for t in AGENT_TOOLS:
+        fn = t["function"]
+        lines.append(f"- {fn['name']}: {fn['description']} | Parameters: {json.dumps(fn['parameters'])}")
+    return "\n".join(lines)
+
+GEMINI_TOOL_PROTOCOL_PROMPT = _build_gemini_tool_prompt()
+
+def _parse_gemini_tool_call(raw_text: str) -> dict | None:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    call = parsed.get("tool_call") if isinstance(parsed, dict) else None
+    if isinstance(call, dict) and call.get("name"):
+        return call
+    return None
+
+# ---------------------------------------------------------------------------
+# TITLE GENERATION & EMBEDDINGS
+# ---------------------------------------------------------------------------
+async def generate_chat_title(engine: str, user_message: str) -> str:
+    if "gemini" in engine.lower():
+        try:
+            prompt = (
+                "You are a title generator. Summarize the user's message into a concise, "
+                f"2 to 4 word title without quotes or filler.\n\nUser message: {user_message}"
+            )
+            response = await gemini_client.aio.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+            title = response.text.strip('"').strip()
+            return title if title else "New Conversation"
+        except Exception:
+            pass
+    else:
+        try:
+            ollama_url = f"{OLLAMA_BASE_URL}/api/chat"
+            model_tag = "qwen2.5:3b" if "qwen" in engine.lower() else "llama3"
+            payload = {
+                "model": model_tag,
+                "messages": [
+                    {"role": "system", "content": "You are a title generator. Summarize into a concise 2-4 word title."},
+                    {"role": "user", "content": user_message},
+                ],
+                "stream": False,
+                "think": False,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            }
+            client = await _get_http_client()
+            response = await client.post(ollama_url, json=payload, timeout=10.0)
+            if response.status_code == 200:
+                data = response.json()
+                title = data.get("message", {}).get("content", "").strip('"').strip()
+                return title if title else "New Conversation"
+        except Exception:
+            pass
+    return user_message[:25] + "..."
+
+async def generate_embedding(text: str, task: str = "search_document") -> list:
+    if task not in ("search_document", "search_query"):
+        task = "search_document"
+    prefixed_text = f"{task}: {text}"
+    try:
+        ollama_url = f"{OLLAMA_BASE_URL}/api/embeddings"
+        payload = {"model": "nomic-embed-text", "prompt": prefixed_text, "keep_alive": OLLAMA_KEEP_ALIVE}
+        client = await _get_http_client()
+        response = await client.post(ollama_url, json=payload, timeout=60.0)
+        if response.status_code == 200:
+            return response.json().get("embedding", [])
+    except Exception:
+        pass
+    return []
+
+def calculate_similarity(vec1: list, vec2: list) -> float:
+    v1, v2 = np.array(vec1), np.array(vec2)
+    if np.linalg.norm(v1) == 0 or np.linalg.norm(v2) == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+
+# ---------------------------------------------------------------------------
+# MAIN CHAT PIPELINE (Dynamic Tool Loop)
+# ---------------------------------------------------------------------------
+async def process_chat_request(
+    engine: str,
+    system_prompt: str,
+    user_message: str,
+    history: list = None,
+    enable_tools: bool = True,
+):
+    if "local" in engine.lower() or "ollama" in engine.lower() or "qwen" in engine.lower():
+        model_tag = resolve_model_tag(engine)
+        ollama_chat_url = f"{OLLAMA_BASE_URL}/api/chat"
+        messages = [{"role": "system", "content": system_prompt}]
+        if history:
+            for msg in history:
+                role = "assistant" if msg.role == "agent" else msg.role
+                messages.append({"role": role, "content": msg.content})
+        messages.append({"role": "user", "content": user_message})
+
+        MAX_TOOL_ROUNDS = 5
+
+        async def _execute_tool_call(call: dict):
+            fn_name = call.get("function", {}).get("name")
+            raw_args = call.get("function", {}).get("arguments", {})
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    raw_args = {}
+            tool_fn = TOOL_DISPATCH.get(fn_name)
+            if not tool_fn:
+                return fn_name, f"Unknown tool: {fn_name}"
+            try:
+                result = await tool_fn(raw_args)
+            except Exception as e:
+                result = f"Tool error: {e}"
+            return fn_name, result
+
+        try:
+            client = await _get_http_client()
+            for _ in range(MAX_TOOL_ROUNDS):
+                payload = {
+                    "model": model_tag,
+                    "messages": messages,
+                    "stream": False,
+                    "think": OLLAMA_THINK_TOOLS,
+                    "keep_alive": OLLAMA_KEEP_ALIVE,
+                    "options": {"num_ctx": OLLAMA_NUM_CTX, "num_gpu": 99, "num_predict": 1024},
+                }
+                if enable_tools:
+                    payload["tools"] = AGENT_TOOLS
+                resp = await _with_retries(client.post, ollama_chat_url, json=payload)
+                resp.raise_for_status()
+                message = resp.json().get("message", {})
+                tool_calls = message.get("tool_calls")
+                if not tool_calls:
+                    content = message.get("content", "")
+                    if content:
+                        yield content
+                    return
+                messages.append(message)
+                tool_results = await asyncio.gather(*(_execute_tool_call(c) for c in tool_calls))
+                for fn_name, result in tool_results:
+                    messages.append({"role": "tool", "name": fn_name, "content": str(result)})
+
+            messages.append({"role": "user", "content": "Based on the verified tool results above, write your final response now."})
+            final_payload = {
+                "model": model_tag,
+                "messages": messages,
+                "stream": True,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+                "options": {"num_ctx": OLLAMA_NUM_CTX, "num_gpu": 99},
+            }
+            async with client.stream("POST", ollama_chat_url, json=final_payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line:
+                        chunk_data = json.loads(line)
+                        chunk = chunk_data.get("message", {}).get("content", "")
+                        if chunk:
+                            yield chunk
+        except Exception as e:
+            yield f"Local Engine Error: {str(e)}"
+
+    elif "gemini" in engine.lower():
+        try:
+            contents = []
+            if history:
+                for msg in history:
+                    role = "model" if msg.role in ["assistant", "agent"] else "user"
+                    contents.append({"role": role, "parts": [{"text": msg.content}]})
+            contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+            if enable_tools:
+                MAX_TOOL_ROUNDS = 5
+                decision_config = types.GenerateContentConfig(
+                    system_instruction=system_prompt + GEMINI_TOOL_PROTOCOL_PROMPT
+                )
+                for _ in range(MAX_TOOL_ROUNDS):
+                    response = await gemini_client.aio.models.generate_content(
+                        model="gemini-2.5-flash", contents=contents, config=decision_config
+                    )
+                    raw_text = (response.text or "").strip()
+                    tool_call = _parse_gemini_tool_call(raw_text)
+                    if not tool_call:
+                        if raw_text:
+                            yield raw_text
+                        return
+
+                    contents.append({"role": "model", "parts": [{"text": raw_text}]})
+                    fn_name = tool_call.get("name")
+                    fn_args = tool_call.get("arguments") or {}
+                    tool_fn = TOOL_DISPATCH.get(fn_name)
+                    if not tool_fn:
+                        tool_result = f"Unknown tool: {fn_name}"
+                    else:
+                        try:
+                            tool_result = await tool_fn(fn_args)
+                        except Exception as e:
+                            tool_result = f"Tool error: {e}"
+                    contents.append({"role": "user", "parts": [{"text": f"[TOOL RESULT for {fn_name}]\n{tool_result}"}]})
+
+                contents.append({"role": "user", "parts": [{"text": "Based on the gathered tool results above, write your final answer now in plain natural language (not JSON)."}]})
+
+            final_config = types.GenerateContentConfig(system_instruction=system_prompt)
+            async for chunk in gemini_client.aio.models.generate_content_stream(model="gemini-2.5-flash", contents=contents, config=final_config):
+                if chunk.text:
+                    yield chunk.text
+        except Exception as e:
+            yield f"Gemini Engine Error: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# DEEP RESEARCH ORCHESTRATOR
+# ---------------------------------------------------------------------------
+async def _generate_text(engine: str, system_prompt: str, user_message: str, json_mode: bool = False, think: bool = None) -> str:
+    model_tag = resolve_model_tag(engine)
+    payload = {
+        "model": model_tag,
+        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
+        "stream": False,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {"num_ctx": OLLAMA_NUM_CTX, "num_gpu": 99},
+    }
+    if json_mode:
+        payload["format"] = "json"
+    if think is not None:
+        payload["think"] = think
+
+    client = await _get_http_client()
+    resp = await _with_retries(client.post, f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+    resp.raise_for_status()
+    return resp.json().get("message", {}).get("content", "")
+
+async def perform_deep_research(engine: str, topic: str, max_subquestions: int = 4, fetch_top_source: bool = True):
+    if "gemini" in engine.lower():
+        yield "⚠️ Deep research is currently configured for local Ollama engines. Switch the agent to a local engine to run this workflow."
+        return
+
+    yield f"🔎 Planning research on: {topic}\n\n"
+    plan_prompt = f"Break the research topic below into {max_subquestions} distinct, specific sub-questions that together produce a complete report. Respond ONLY with a JSON array of strings, nothing else.\n\nTopic: {topic}"
+    raw_plan = await _generate_text(engine, "You are a meticulous research planner.", plan_prompt, json_mode=True)
+    try:
+        subquestions = json.loads(raw_plan)
+        if not isinstance(subquestions, list) or not subquestions:
+            raise ValueError
+    except Exception:
+        subquestions = [topic]
+    subquestions = subquestions[:max_subquestions]
+
+    yield f"📚 Researching {len(subquestions)} angles in parallel...\n"
+    async def _research_one(sub_q: str):
+        search_text, sources = await _search_structured(sub_q, max_results=4)
+        excerpt = search_text
+        if fetch_top_source and sources:
+            top_url = sources[0]["url"]
+            page_text = await fetch_url_content(top_url, focus=sub_q, max_chars=2500)
+            if not page_text.startswith("Error"):
+                excerpt += f"\n(Deeper excerpt from {top_url}):\n{page_text}\n"
+        return sub_q, excerpt, sources
+
+    results = await asyncio.gather(*(_research_one(q) for q in subquestions))
+    source_registry: dict = {}
+    scratchpad = ""
+    for sub_q, excerpt, sources in results:
+        for s in sources:
+            url = s.get("url")
+            if url and url not in source_registry:
+                source_registry[url] = {"id": len(source_registry) + 1, "title": s.get("title", url), "url": url}
+        scratchpad += f"\n### {sub_q}\n{excerpt}\n"
+
+    yield "✍️ Synthesizing findings...\n\n"
+    source_list_text = "\n".join(f"[{v['id']}] {v['title']} — {v['url']}" for v in source_registry.values())
+    synth_prompt = (
+        f"Using ONLY the research notes below, write a thorough, well-organized report to: '{topic}'.\n"
+        f"Cite claims inline using bracket numbers like [1], [2] that match the SOURCE LIST exactly. Do not invent citations.\n"
+        f"If the notes do not cover a specific claim, state that clearly.\n\n"
+        f"SOURCE LIST:\n{source_list_text}\n\nRESEARCH NOTES:\n{scratchpad[:12000]}"
+    )
+    final_answer = await _generate_text(engine, "You are a rigorous research analyst who never fabricates sources.", synth_prompt, think=OLLAMA_THINK_SYNTHESIS)
+    references = "\n".join(f"[{v['id']}] [{v['title']}]({v['url']})" for v in source_registry.values())
+    yield final_answer + ("\n\n---\n**Sources**\n" + references if references else "")

@@ -3,8 +3,11 @@ import {
   UploadCloud, FileText, Trash2, Database, Search, 
   CheckCircle2, Loader2, Cpu, Edit2, FolderArchive, X
 } from 'lucide-react';
+import { useAuth } from './AuthContext'; // 1. IMPORT USEAUTH
 
 const KnowledgeBase = () => {
+  const { backend, token } = useAuth(); // 2. GRAB TOKEN AND BACKEND
+
   // --- STATE ---
   const [kbs, setKbs] = useState([]);
   const [agents, setAgents] = useState([]);
@@ -19,10 +22,14 @@ const KnowledgeBase = () => {
 
   // --- DATA FETCHING ---
   const fetchData = async () => {
+    if (!token) return; // Guard clause
+    
     try {
+      const headers = { 'Authorization': `Bearer ${token}` }; // 3. CREATE HEADERS
+      
       const [agentsRes, kbsRes] = await Promise.all([
-        fetch('http://localhost:8000/api/dashboard/agents').catch(() => null),
-        fetch('http://localhost:8000/api/knowledge').catch(() => null)
+        fetch(`${backend}/api/dashboard/agents`, { headers }).catch(() => null),
+        fetch(`${backend}/api/knowledge`, { headers }).catch(() => null)
       ]);
       
       if (agentsRes && agentsRes.ok) {
@@ -39,7 +46,7 @@ const KnowledgeBase = () => {
 
   useEffect(() => {
     fetchData();
-  }, []);
+  }, [backend, token]); // Add dependencies
 
   // --- DRAG & DROP HANDLERS ---
   const handleDragOver = (e) => {
@@ -84,8 +91,9 @@ const KnowledgeBase = () => {
     formData.append("file", selectedFile);
 
     try {
-      const res = await fetch('http://localhost:8000/api/knowledge', {
+      const res = await fetch(`${backend}/api/knowledge`, {
         method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` }, // 4. ADD HEADER TO POST
         body: formData
       });
       if (res.ok) {
@@ -104,7 +112,10 @@ const KnowledgeBase = () => {
 
   const handleDeleteKB = async (kbId) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/knowledge/${kbId}`, { method: 'DELETE' });
+      const res = await fetch(`${backend}/api/knowledge/${kbId}`, { 
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` } // 5. ADD HEADER TO DELETE
+      });
       if (res.ok) {
         setKbs(prev => prev.filter(kb => (kb._id || kb.id) !== kbId));
       }
@@ -126,6 +137,7 @@ const KnowledgeBase = () => {
     return acc;
   }, {});
 
+  // ... (The rest of your KnowledgeBase.jsx UI code remains exactly the same below here)
   return (
     <main className="flex-1 relative z-10 flex flex-col h-screen overflow-hidden bg-zinc-950">
       
