@@ -732,30 +732,53 @@ def _parse_gemini_tool_call(raw: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # AGENT TITLE GENERATION
 # ---------------------------------------------------------------------------
+
 async def generate_chat_title(engine: str, user_message: str) -> str:
+    # 1. Few-Shot Prompting: Shows the LLM exactly how to behave instead of just telling it
     sys_prompt = (
-        "Task: Extract a clean, 2-4 word title representing the core topic of the message.\n"
-        "STRICT RULES:\n"
-        "1. DO NOT include conversational filler words like 'okay', 'sure', 'here', 'give', 'then', 'can', 'you', 'please', 'show'.\n"
-        "2. Output ONLY the core subject/topic.\n"
-        "3. NO quotes, NO prefixes, NO punctuation."
+        "You are a strict title generator. Extract the core topic of the user's message into a 2-4 word title.\n\n"
+        "CRITICAL RULES:\n"
+        "1. NEVER use conversational fillers (e.g., 'Okay', 'Sure', 'Hi', 'Hello', 'Can you', 'Give me', 'I want', 'Please').\n"
+        "2. NEVER use prefixes like 'Title:', 'Topic:', or 'Summary:'.\n"
+        "3. Output ONLY the short title. No quotes, no punctuation.\n\n"
+        "EXAMPLES:\n"
+        "User: 'I want some pics of BMW'\nOutput: BMW Image Search\n\n"
+        "User: 'can you give me the latest trending tamil songs'\nOutput: Trending Tamil Songs\n\n"
+        "User: 'okay, you can shoot'\nOutput: New Conversation\n\n"
+        "User: 'what is the weather in tokyo'\nOutput: Tokyo Weather"
     )
     
     short_msg = user_message[:500] 
 
-    def clean_fallback(text):
-        cleaned = re.sub(r"^(Title|Here is|Summary|Topic|Okay|Sure|Please|Can you|Give me|Show me|Then|Hi|Hello|Hey)[:\- ]*", "", text, flags=re.IGNORECASE).strip()
-        return cleaned[:25] + "..." if cleaned else "New Conversation"
+    # 2. Aggressive Python Scrubbing: Physically deletes junk words if the LLM disobeys
+    def clean_title(raw_text, original_msg):
+        # Remove quotes and asterisks
+        cleaned = raw_text.strip('"\'.* \n')
+        
+        # Regex to strip conversational prefixes that LLMs stubbornly include
+        filler_pattern = r"^(Title|Here is|Summary|Topic|Okay|Sure|Please|Can you|Give me|Show me|I want|I need|Then|Hi|Hello|Hey|Alright|Let's)[\s\:\-]*"
+        cleaned = re.sub(filler_pattern, "", cleaned, flags=re.IGNORECASE).strip()
+        
+        # If the LLM just parroted the exact user message or gave an empty string, fallback to manual parsing
+        if not cleaned or len(cleaned) < 3 or cleaned.lower() == original_msg.lower():
+            # Manually strip filler words and title-case the first 3 substantive words
+            stop_words = {"i", "want", "some", "a", "an", "the", "can", "you", "give", "me", "please", "okay", "hi", "hello", "hey", "is", "what", "how", "to"}
+            words = [w for w in original_msg.split() if w.lower() not in stop_words]
+            if words:
+                return " ".join(words[:4]).title()
+            return "New Conversation"
+            
+        # Limit to 5 words max natively in python just to be safe
+        return " ".join(cleaned.split()[:5]).title()
 
     if "gemini" in engine.lower():
         try:
             resp = await gemini_client.aio.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=f"{sys_prompt}\n\nMessage: {short_msg}",
+                contents=f"{sys_prompt}\n\nUser: '{short_msg}'\nOutput:",
                 config={"temperature": 0.1}
             )
-            title = resp.text.strip('"\'.* \n')
-            return title if title else clean_fallback(short_msg)
+            return clean_title(resp.text, short_msg)
         except Exception: pass
     else:
         try:
@@ -764,7 +787,7 @@ async def generate_chat_title(engine: str, user_message: str) -> str:
                 "model": resolve_model_tag(engine),
                 "messages": [
                     {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": short_msg}
+                    {"role": "user", "content": f"User: '{short_msg}'\nOutput:"}
                 ],
                 "stream": False,
                 "options": {
@@ -778,16 +801,11 @@ async def generate_chat_title(engine: str, user_message: str) -> str:
                 timeout=10.0
             )
             if resp.status_code == 200:
-                raw_title = resp.json().get("message", {}).get("content", "").strip()
-                cleaned = re.sub(r"^(Title|Here is|Summary|Topic|Okay|Sure|Please|Can you|Give me|Show me|Then)[:\- ]*", "", raw_title, flags= re.IGNORECASE).strip()
-                filler_words = r"^(okay|sure|here|give|then|please|can|you|show|hey|hi|hello)\b[\s\-]*"
-                cleaned = re.sub(filler_words, "", cleaned, flags=re.IGNORECASE).strip()
-                cleaned = re.sub(filler_words, "", cleaned, flags=re.IGNORECASE).strip() 
-                title = cleaned.strip('"\'.* \n')
-                return title if title else clean_fallback(short_msg)
+                raw_title = resp.json().get("message", {}).get("content", "")
+                return clean_title(raw_title, short_msg)
         except Exception: pass
         
-    return clean_fallback(short_msg)
+    return clean_title(short_msg, short_msg)
 
 # ---------------------------------------------------------------------------
 # SANITIZED CLIENT-FACING TRACE HELPER
